@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+*.out
+*.bin
+tmp_reliable/*/*
+tmp_reliable/*/**
+!tmp_reliable/*/.gitkeep

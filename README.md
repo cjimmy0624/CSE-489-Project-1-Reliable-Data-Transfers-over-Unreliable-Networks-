@@ -287,5 +287,3 @@ netif_connect(sock, peer_ip, peer_port);
 netif_send(sock, buf, len);
 netif_recv(sock, buf, sizeof(buf), timeout_ms);
 ```
-#   C S E - 4 8 9 - P r o j e c t - 1 - R e l i a b l e - D a t a - T r a n s f e r s - o v e r - U n r e l i a b l e - N e t w o r k s -  
- 

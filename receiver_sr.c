@@ -85,7 +85,7 @@ int main(int argc, char **argv) {
     static uint16_t slot_len[SR_MAX_WINDOW];
     static uint8_t slot_data[SR_MAX_WINDOW][MAX_PAYLOAD];
 
-    uint32_t expected = 0;
+    uint32_t expected = 0; // next packet to write (receiver's base)
     int done = 0;
     int fin_seen = 0;
     uint64_t fin_deadline_ms = 0;
@@ -139,7 +139,7 @@ int main(int argc, char **argv) {
                     has_packet[j] = 0;
                     expected++;
                 }
-            } else if (hdr.seq >= expected) { // outside the window
+            } else if (hdr.seq >= expected) {
                 do_ack = 0;
             }
 

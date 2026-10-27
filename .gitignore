@@ -12,3 +12,13 @@
 tmp_reliable/*/*
 tmp_reliable/*/**
 !tmp_reliable/*/.gitkeep
+
+receiver_basic 
+receiver_gbn 
+receiver_sr 
+
+sender_basic
+sender_gbn
+sender_sr
+
+*.swp

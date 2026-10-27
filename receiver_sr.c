@@ -10,7 +10,7 @@
 
 static void usage(const char *prog) {
     fprintf(stderr,
-            "Usage: %s --listen PORT --peer_ip IP --peer_port PORT --out FILE\n",
+            "Usage: %s --listen PORT --peer_ip IP --peer_port PORT --out FILE [--win N]\n",
             prog);
 }
 
@@ -25,6 +25,7 @@ int main(int argc, char **argv) {
     const char *peer_ip = NULL;
     int peer_port = -1;
     const char *out_path = NULL;
+    int win = 20;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--listen") == 0 && i + 1 < argc) {
@@ -35,15 +36,21 @@ int main(int argc, char **argv) {
             peer_port = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (strcmp(argv[i], "--win") == 0 && i + 1 < argc) {
+            win = atoi(argv[++i]);
         } else {
             usage(argv[0]);
             return 1;
         }
     }
 
-    if (listen_port <= 0 || !peer_ip || peer_port <= 0 || !out_path) {
+    if (listen_port <= 0 || !peer_ip || peer_port <= 0 || !out_path || win <= 0) {
         usage(argv[0]);
         return 1;
+    }
+
+    if (win > SR_MAX_WINDOW) {
+        win = SR_MAX_WINDOW;
     }
 
     FILE *out = fopen(out_path, "wb");
@@ -73,6 +80,10 @@ int main(int argc, char **argv) {
     }
 
     uint8_t recvbuf[PKT_HDR_LEN + MAX_PAYLOAD];
+
+    static uint8_t has_packet[SR_MAX_WINDOW];
+    static uint16_t slot_len[SR_MAX_WINDOW];
+    static uint8_t slot_data[SR_MAX_WINDOW][MAX_PAYLOAD];
 
     uint32_t expected = 0;
     int done = 0;
@@ -112,22 +123,35 @@ int main(int argc, char **argv) {
             continue;
         }
         if (hdr.type == PKT_TYPE_DATA) {
-            // We received an DATA packet, write it to the output file
-			if (payload_len > 0) {
-				fwrite(payload, 1, payload_len, out);
-			}
-
-            // After we receive an DATA packet, we send an ACK
-			// Here we implement an example ACK send call 
-            // TODO(student): change ACK policy according to GBN or SR
-
-            uint8_t ackbuf[PKT_HDR_LEN + MAX_PAYLOAD];
-            uint32_t ack_no = hdr.seq + 1;
-            size_t pktlen = pkt_build_ack(ackbuf, sizeof(ackbuf), ack_no);
-            if (pktlen > 0) {
-                netif_send(sock, ackbuf, pktlen);
+            int do_ack = 1;
+            if (hdr.seq >= expected && hdr.seq < expected + (uint32_t)win) { // inside the window
+                uint32_t idx = hdr.seq % SR_MAX_WINDOW;
+                if (!has_packet[idx]) {
+                    memcpy(slot_data[idx], payload, payload_len);
+                    slot_len[idx] = payload_len;
+                    has_packet[idx] = 1;
+                }
+                while (has_packet[expected % SR_MAX_WINDOW]) { // write out in-order packets
+                    uint32_t j = expected % SR_MAX_WINDOW;
+                    if (slot_len[j] > 0) {
+                        fwrite(slot_data[j], 1, slot_len[j], out);
+                    }
+                    has_packet[j] = 0;
+                    expected++;
+                }
+            } else if (hdr.seq >= expected) { // outside the window
+                do_ack = 0;
             }
-        } else if (hdr.type == PKT_TYPE_FIN) {
+
+            if (do_ack) {
+                uint8_t ackbuf[PKT_HDR_LEN + MAX_PAYLOAD];
+                uint32_t ack_no = hdr.seq;
+                size_t pktlen = pkt_build_ack(ackbuf, sizeof(ackbuf), ack_no);
+                if (pktlen > 0) {
+                    netif_send(sock, ackbuf, pktlen);
+                }
+            }
+        } else if (hdr.type == PKT_TYPE_FIN && hdr.seq == expected) {
 			// We receive an FIN packet
             // FIN marks end of file; reply with FINACK.
             uint8_t finbuf[PKT_HDR_LEN + MAX_PAYLOAD];

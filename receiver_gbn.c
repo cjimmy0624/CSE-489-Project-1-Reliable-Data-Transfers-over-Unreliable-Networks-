@@ -66,11 +66,20 @@ int main(int argc, char **argv) {
         return 1;
     }
     // Tell emulator which peer port to forward to.
-    if (netif_connect(sock, peer_ip, peer_port) != 0) {
-        fclose(out);
-        close(sock);
-        return 1;
-    }
+    // if (netif_connect(sock, peer_ip, peer_port) != 0) {
+    //      fclose(out);
+    //      close(sock);
+    //      return 1;
+    //  }
+     for (int attempt = 0; attempt < 10; attempt++) {
+         if (netif_connect(sock, peer_ip, peer_port) != 0) {
+             fclose(out);
+             close(sock);
+             return 1;
+         }
+         struct timespec delay = {0, 100000000L};
+         nanosleep(&delay, NULL);  // Wait 100 ms between registrations.
+     }
 
     uint8_t recvbuf[PKT_HDR_LEN + MAX_PAYLOAD];
 
@@ -83,6 +92,9 @@ int main(int argc, char **argv) {
     // TODO(student): implement GBN/SR receiver logic here:
     //   - GBN: discard out-of-order, ACK last in-order
     //   - SR: buffer out-of-order, ACK each packet
+
+    int error = 0;
+
     while (!done) {
         int timeout_ms = -1;
         if (fin_seen) {
@@ -98,6 +110,7 @@ int main(int argc, char **argv) {
         ssize_t n = netif_recv(sock, recvbuf, sizeof(recvbuf), timeout_ms);
         if (n < 0) {
             perror("recv");
+            error = 1;
             break;
         }
         if (n == 0) {
@@ -113,27 +126,44 @@ int main(int argc, char **argv) {
         }
         if (hdr.type == PKT_TYPE_DATA) {
             // We received an DATA packet, write it to the output file
-			if (payload_len > 0) {
-				fwrite(payload, 1, payload_len, out);
-			}
+			uint8_t ackbuf[PKT_HDR_LEN + MAX_PAYLOAD];
+
+            //ADDED CODE
+            if (hdr.seq == expected){
+                if (payload_len > 0){
+                    if (fwrite(payload,1,payload_len,out) != payload_len){
+                        perror("fwrite");
+                        error = 1;
+                        break;
+                    }
+                }
+                expected++;
+            }
 
             // After we receive an DATA packet, we send an ACK
 			// Here we implement an example ACK send call 
             // TODO(student): change ACK policy according to GBN or SR
-
-            uint8_t ackbuf[PKT_HDR_LEN + MAX_PAYLOAD];
-            uint32_t ack_no = hdr.seq + 1;
-            size_t pktlen = pkt_build_ack(ackbuf, sizeof(ackbuf), ack_no);
+            size_t pktlen = pkt_build_ack(ackbuf, sizeof(ackbuf), expected);
             if (pktlen > 0) {
-                netif_send(sock, ackbuf, pktlen);
+                if (netif_send(sock, ackbuf, pktlen) < 0){
+                    perror("ACK sent");
+                    error = 1;
+                    break;
+                }
             }
-        } else if (hdr.type == PKT_TYPE_FIN) {
+
+        } 
+        else if (hdr.type == PKT_TYPE_FIN) {
 			// We receive an FIN packet
             // FIN marks end of file; reply with FINACK.
             uint8_t finbuf[PKT_HDR_LEN + MAX_PAYLOAD];
             size_t pktlen = pkt_build_finack(finbuf, sizeof(finbuf), expected);
             if (pktlen > 0) {
-                netif_send(sock, finbuf, pktlen);
+                if (netif_send(sock, finbuf, pktlen) < 0){
+                    perror("FINACK sent");
+                    error = 1;
+                    break;
+                }
             }
             fin_seen = 1;
             fin_deadline_ms = now_ms() + 1000;
@@ -142,5 +172,5 @@ int main(int argc, char **argv) {
 
     fclose(out);
     close(sock);
-    return done ? 0 : 1;
+    return (done && !error) ? 0 : 1;
 }

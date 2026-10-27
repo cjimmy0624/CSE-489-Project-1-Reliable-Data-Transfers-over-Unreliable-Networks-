@@ -9,6 +9,9 @@
 #include <sys/stat.h>
 #include <time.h>
 
+//ADDED CODE
+#include <stdbool.h>
+
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s --listen PORT --peer_ip IP --peer_port PORT --in FILE --win N --timeout MS\n",
@@ -53,6 +56,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    //ADDED CODE
+    if (rto_ms < 500) {
+        rto_ms = 500;
+    }
+
     FILE *in = fopen(in_path, "rb");
     if (!in) {
         perror("fopen");
@@ -81,11 +89,21 @@ int main(int argc, char **argv) {
         return 1;
     }
     // Tell emulator which peer port to forward to.
-    if (netif_connect(sock, peer_ip, peer_port) != 0) {
-        fclose(in);
-        close(sock);
-        return 1;
-    }
+    //  if (netif_connect(sock, peer_ip, peer_port) != 0) {
+    //      fclose(in);
+    //      close(sock);
+    //      return 1;
+    //  }
+    // Register with the emulator multiple times to handle startup races.
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (netif_connect(sock, peer_ip, peer_port) != 0) {
+             fclose(in);
+             close(sock);
+             return 1;
+         }
+         struct timespec delay = {0, 100000000L};
+         nanosleep(&delay, NULL); 
+     }
 
     uint8_t buf[PKT_HDR_LEN + MAX_PAYLOAD];
     uint8_t recvbuf[PKT_HDR_LEN + MAX_PAYLOAD];
@@ -96,80 +114,169 @@ int main(int argc, char **argv) {
     uint64_t start_ms = 0;
     uint64_t end_ms = 0;
 
+    //ADDED CODE ->window buffer variables
+    uint8_t win_buf[win][sizeof(buf)];
+    size_t pkt_lengths[win];
+    size_t index = 0;
+    uint32_t base = 0;
+    bool breakOr = true;
+    uint64_t timer_ms = 0;
+
+
     // Basic sender: send each data packet once, then send FIN once.
     // TODO(student): implement GBN/SR reliability here:
     //   - keep a send window and buffer unacked packets
     //   - start/restart timers and retransmit on timeout
     //   - process ACKs to slide the window and compute RTT/RTO
     while (1) {
-        size_t nread = fread(buf + PKT_HDR_LEN, 1, MAX_PAYLOAD, in);
-        if (nread == 0) {
-            break;
-        }
 
-        // Build a DATA packet: header + payload.
-        size_t pktlen = pkt_build_data(buf, sizeof(buf), seq, buf + PKT_HDR_LEN, (uint16_t)nread);
-        if (pktlen == 0) {
-            fprintf(stderr, "packet build failed\n");
-            fclose(in);
-            close(sock);
-            return 1;
-        }
+        //ADDED CODE
+        if (base == seq && !breakOr){
+                break;
+            }
+        while(seq < base + win && breakOr){
+            size_t nread = fread(buf + PKT_HDR_LEN, 1, MAX_PAYLOAD, in);
 
-        // Example data send call (goes through emulator).
-        // TODO(student): in your reliable sender, send from a window buffer.
-        if (netif_send(sock, buf, pktlen) < 0) {
-            perror("sendto");
-            fclose(in);
-            close(sock);
-            return 1;
-        }
+            if (nread == 0) {
+                if (ferror(in)) {
+                    perror("fread");
+                    fclose(in);
+                    close(sock);
+                    return 1;
+                    }
 
-        // Example ACK receive path (non-blocking). We only count ACKs here.
-        // TODO(student): use ACKs to slide the window and retransmit on timeout.
-        ssize_t rn = netif_recv(sock, recvbuf, sizeof(recvbuf), 0);
-        if (rn > 0) {
-            pkt_hdr_t hdr;
-            if (pkt_parse(recvbuf, (size_t)rn, &hdr, NULL, NULL) == 0) {
-                if (hdr.type == PKT_TYPE_ACK) {
-                    ack_rcvd++;
+                breakOr = false;
+                break;
+            }
+
+            // Build a DATA packet: header + payload.
+            size_t pktlen = pkt_build_data(buf, sizeof(buf), seq, buf + PKT_HDR_LEN, (uint16_t)nread);
+            if (pktlen == 0) {
+                fprintf(stderr, "packet build failed\n");
+                fclose(in);
+                close(sock);
+                return 1;
+            }
+
+            //ADDED CODED -> initalized window buffer variables
+            index = seq % win;
+            pkt_lengths[index] = pktlen;
+            memcpy(win_buf[index],buf,pktlen);
+
+            // Example data send call (goes through emulator).
+            // TODO(student): in your reliable sender, send from a window buffer.
+            if (netif_send(sock, buf, pktlen) < 0) {
+                perror("sendto");
+                fclose(in);
+                close(sock);
+                return 1;
+                }
+
+                if (start_ms == 0) {
+                start_ms = now_ms();
+            }
+            data_sent += 1;
+
+            //ADDED CODE
+            if (base == seq){
+                timer_ms = now_ms();
+            }
+            seq += 1;
+            }
+        
+            // Example ACK receive path (non-blocking). We only count ACKs here.
+            // TODO(student): use ACKs to slide the window and retransmit on timeout.
+            ssize_t rn = netif_recv(sock, recvbuf, sizeof(recvbuf), 10);
+            if (rn > 0) {
+                pkt_hdr_t hdr;
+                if (pkt_parse(recvbuf, (size_t)rn, &hdr, NULL, NULL) == 0) {
+                    if (hdr.type == PKT_TYPE_ACK) {
+                        ack_rcvd++;
+                        //ADDED CODE
+                        if (hdr.ack > base && hdr.ack <= seq) {
+                            base = hdr.ack;
+                            if (base < seq) {
+                                timer_ms = now_ms();
+                            } else {
+                                timer_ms = 0;
+                            }
+                        }
+                    }
                 }
             }
-        }
 
-        if (start_ms == 0) {
-            start_ms = now_ms();
-        }
-        data_sent += 1;
-        seq += 1;
+            //ADDED CODE
+            if (base < seq && now_ms() - timer_ms >= (uint64_t)rto_ms){
+                for (uint32_t resending_pkt = base; resending_pkt < seq; resending_pkt++){
+                    index = resending_pkt % win;
+                    size_t pktlen = pkt_lengths[index];
+
+                    if (netif_send(sock, win_buf[index], pktlen) < 0) {
+                        perror("sendto");
+                        fclose(in);
+                        close(sock);
+                        return 1;
+                    }
+                    data_retx += 1;
+
+                }
+                timer_ms = now_ms();
+            }
+
     }
 
     // Basic FIN send (no retransmission).
     // Build and send FIN to mark end of file.
     size_t fin_len = pkt_build_fin(buf, sizeof(buf), seq);
-    if (fin_len > 0) {
-        netif_send(sock, buf, fin_len);
+
+    //ADDED CODE
+    if (fin_len == 0) {
+        fprintf(stderr, "FIN packet build failed\n");
+        fclose(in);
+        close(sock);
+        return 1;
     }
 
-    // Basic wait for FINACK (no retries).
-    uint64_t wait_ms = 0;
-    while (wait_ms < (uint64_t)rto_ms) {
-        ssize_t n = netif_recv(sock, recvbuf, sizeof(recvbuf), 50);
-        if (n > 0) {
-            pkt_hdr_t hdr;
-            if (pkt_parse(recvbuf, (size_t)n, &hdr, NULL, NULL) == 0) {
-                if (hdr.type == PKT_TYPE_FINACK) {
-                    end_ms = now_ms();
-                    break;
-                }
-                if (hdr.type == PKT_TYPE_ACK) {
-                    ack_rcvd++;
-                }
-            }
+    bool finack_rev = false;
+    int finack_tries = 0;
+    const int FINACK_RETRIES = 10;
+
+    while (!finack_rev && finack_tries <= FINACK_RETRIES) {
+        if (netif_send(sock, buf, fin_len) < 0) {
+            perror("FIN send");
+            fclose(in);
+            close(sock);
+            return 1;
         }
-        wait_ms += 50;
+        // Basic wait for FINACK (no retries).
+        uint64_t wait_ms = now_ms();
+        while (now_ms() - wait_ms < (uint64_t)rto_ms) {
+            ssize_t n = netif_recv(sock, recvbuf, sizeof(recvbuf), 50);
+            if (n > 0) {
+                pkt_hdr_t hdr;
+                if (pkt_parse(recvbuf, (size_t)n, &hdr, NULL, NULL) == 0) {
+                    if (hdr.type == PKT_TYPE_FINACK) {
+                        finack_rev = true;
+                        end_ms = now_ms();
+                        break;
+                    }
+                    if (hdr.type == PKT_TYPE_ACK) {
+                        ack_rcvd++;
+                    }
+                }
+            }        
+        }
+        if (!finack_rev) {
+                finack_tries++;
+            }
     }
-
+    // Fail if FINACK never arrives.
+    if (!finack_rev) {
+        fprintf(stderr, "FINACK not received after retries\n");
+        fclose(in);
+        close(sock);
+        return 1;
+    }
     if (!end_ms) {
         end_ms = now_ms();
     }

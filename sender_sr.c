@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#define FIN_MAX_TRIES 30    // Number of attempts FIN will retry 
+
 static void usage(const char *prog) {
     fprintf(stderr,
             "Usage: %s --listen PORT --peer_ip IP --peer_port PORT --in FILE --win N --timeout MS\n",
@@ -47,6 +49,9 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+
+    if (win > SR_MAX_WINDOW) 
+        win = SR_MAX_WINDOW; 
 
     if (listen_port <= 0 || !peer_ip || peer_port <= 0 || !in_path || win <= 0 || rto_ms <= 0) {
         usage(argv[0]);
@@ -89,85 +94,124 @@ int main(int argc, char **argv) {
 
     uint8_t buf[PKT_HDR_LEN + MAX_PAYLOAD];
     uint8_t recvbuf[PKT_HDR_LEN + MAX_PAYLOAD];
-    uint32_t seq = 0;
+    uint32_t seq = 0;             // next new packet to send
     uint64_t data_sent = 0;
     uint64_t data_retx = 0;
     uint64_t ack_rcvd = 0;
     uint64_t start_ms = 0;
     uint64_t end_ms = 0;
 
-    // Basic sender: send each data packet once, then send FIN once.
-    // TODO(student): implement GBN/SR reliability here:
-    //   - keep a send window and buffer unacked packets
-    //   - start/restart timers and retransmit on timeout
-    //   - process ACKs to slide the window and compute RTT/RTO
-    while (1) {
-        size_t nread = fread(buf + PKT_HDR_LEN, 1, MAX_PAYLOAD, in);
-        if (nread == 0) {
+    static uint8_t win_pkt[SR_MAX_WINDOW][PKT_HDR_LEN + MAX_PAYLOAD];
+    size_t win_len[SR_MAX_WINDOW] = {0};
+    uint8_t ack[SR_MAX_WINDOW] = {0};
+    uint64_t sent_time[SR_MAX_WINDOW] = {0};
+    uint32_t base = 0;  // oldest packet not ACKed yet. 
+    int eof = 0;
+
+    while (!eof || base < seq) {
+        while (!eof && seq < base + (uint32_t)win) {
+            size_t nread = fread(buf + PKT_HDR_LEN, 1, MAX_PAYLOAD, in);
+            if (nread == 0) {
+                eof = 1;
+                break;
+            }
+
+            // Build a DATA packet: header + payload.
+            size_t pktlen = pkt_build_data(buf, sizeof(buf), seq, buf + PKT_HDR_LEN, (uint16_t)nread);
+            if (pktlen == 0) {
+                fprintf(stderr, "packet build failed\n");
+                fclose(in);
+                close(sock);
+                return 1;
+            }
+
+            uint32_t idx = seq % SR_MAX_WINDOW;
+            memcpy(win_pkt[idx], buf, pktlen);
+            win_len[idx] = pktlen;
+            ack[idx] = 0;
+
+            if (netif_send(sock, buf, pktlen) < 0) {
+                perror("sendto");
+                fclose(in);
+                close(sock);
+                return 1;
+            }
+
+            if (start_ms == 0) {
+                start_ms = now_ms();
+            }
+            sent_time[idx] = now_ms();
+            data_sent += 1;
+            seq += 1;
+        }
+        if (base == seq) {
             break;
         }
 
-        // Build a DATA packet: header + payload.
-        size_t pktlen = pkt_build_data(buf, sizeof(buf), seq, buf + PKT_HDR_LEN, (uint16_t)nread);
-        if (pktlen == 0) {
-            fprintf(stderr, "packet build failed\n");
-            fclose(in);
-            close(sock);
-            return 1;
+        uint64_t now = now_ms();
+        uint64_t earliest_deadline = UINT64_MAX;
+        for (uint32_t p = base; p < seq; p++) {
+            uint32_t idx = p % SR_MAX_WINDOW;
+            if (!ack[idx] && sent_time[idx] + (uint64_t)rto_ms < earliest_deadline) {
+                earliest_deadline = sent_time[idx] + (uint64_t)rto_ms;
+            }
         }
 
-        // Example data send call (goes through emulator).
-        // TODO(student): in your reliable sender, send from a window buffer.
-        if (netif_send(sock, buf, pktlen) < 0) {
-            perror("sendto");
-            fclose(in);
-            close(sock);
-            return 1;
-        }
+        int wait_time = (earliest_deadline <= now) ? 0 : (int)(earliest_deadline - now);
 
-        // Example ACK receive path (non-blocking). We only count ACKs here.
-        // TODO(student): use ACKs to slide the window and retransmit on timeout.
-        ssize_t rn = netif_recv(sock, recvbuf, sizeof(recvbuf), 0);
+        ssize_t rn = netif_recv(sock, recvbuf, sizeof(recvbuf), wait_time);
         if (rn > 0) {
             pkt_hdr_t hdr;
             if (pkt_parse(recvbuf, (size_t)rn, &hdr, NULL, NULL) == 0) {
                 if (hdr.type == PKT_TYPE_ACK) {
                     ack_rcvd++;
+                    uint32_t a = hdr.ack;
+                    uint32_t idx = a % SR_MAX_WINDOW;
+                    if (a >= base && a < seq && !ack[idx]) {
+                        ack[idx] = 1;
+                        while (base < seq && ack[base % SR_MAX_WINDOW]) {
+                            base++;
+                        }
+                    }
                 }
             }
         }
 
-        if (start_ms == 0) {
-            start_ms = now_ms();
+        now = now_ms();
+        for (uint32_t s = base; s < seq; s++) {
+            uint32_t idx = s % SR_MAX_WINDOW;
+            if (!ack[idx] && now >= sent_time[idx] + (uint64_t)rto_ms) {
+                netif_send(sock, win_pkt[idx], win_len[idx]);
+                sent_time[idx] = now;
+                data_sent++;
+                data_retx++;
+            }
         }
-        data_sent += 1;
-        seq += 1;
     }
 
-    // Basic FIN send (no retransmission).
-    // Build and send FIN to mark end of file.
     size_t fin_len = pkt_build_fin(buf, sizeof(buf), seq);
-    if (fin_len > 0) {
-        netif_send(sock, buf, fin_len);
-    }
+    for (int tries = 0; tries < FIN_MAX_TRIES && !end_ms; tries++) {
+        if (fin_len > 0) {
+            netif_send(sock, buf, fin_len);
+        }
 
-    // Basic wait for FINACK (no retries).
-    uint64_t wait_ms = 0;
-    while (wait_ms < (uint64_t)rto_ms) {
-        ssize_t n = netif_recv(sock, recvbuf, sizeof(recvbuf), 50);
-        if (n > 0) {
-            pkt_hdr_t hdr;
-            if (pkt_parse(recvbuf, (size_t)n, &hdr, NULL, NULL) == 0) {
-                if (hdr.type == PKT_TYPE_FINACK) {
-                    end_ms = now_ms();
-                    break;
-                }
-                if (hdr.type == PKT_TYPE_ACK) {
-                    ack_rcvd++;
+        uint64_t wait_ms = 0;
+        while (wait_ms < (uint64_t)rto_ms) {
+            ssize_t n = netif_recv(sock, recvbuf, sizeof(recvbuf), 50);
+            if (n > 0) {
+                pkt_hdr_t hdr;
+                if (pkt_parse(recvbuf, (size_t)n, &hdr, NULL, NULL) == 0) {
+                    if (hdr.type == PKT_TYPE_FINACK) {
+                        end_ms = now_ms();
+                        break;
+                    }
+                    if (hdr.type == PKT_TYPE_ACK) {
+                        ack_rcvd++;
+                    }
                 }
             }
+            wait_ms += 50;
         }
-        wait_ms += 50;
     }
 
     if (!end_ms) {
